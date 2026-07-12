@@ -11,9 +11,11 @@
 #include "uthash.h"
 
 #define WATCH_PATH "/home/matt/Projects"
-#define MAX_PATH_LEN 1024	// 1KB
+#define MAX_PATH_LEN 1024	
+#define BACH_COUNT 100	// Amt of events that can be read from kernel at once
 
-static uint32_t event_mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE |  IN_DELETE | IN_DELETE_SELF;
+
+static uint32_t event_mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_MOVE_SELF | IN_CREATE |  IN_DELETE | IN_DELETE_SELF;
 
 struct wddir {
 	int wd;			// key
@@ -28,12 +30,10 @@ struct wddir* hashmap = NULL;
 // ========================================================
 
 void add_wddir(int wd, const char* path) {
-    	struct wddir* entry;
-
-    	entry = malloc(sizeof *entry);
+    	struct wddir* entry = (struct wddir*)malloc(sizeof *entry);
     	entry->wd = wd;
-    	strcpy(entry->path, path);
-    	HASH_ADD_INT(hashmap, wd, entry);  /* wd: name of key field */
+    	entry->path = strdup(path);		/* Copy path to the heap */
+	HASH_ADD_INT(hashmap, wd, entry);	/* wd: name of key field */
 }
 
 struct wddir* find_user(int wd_key) {
@@ -44,8 +44,10 @@ struct wddir* find_user(int wd_key) {
 }
 
 void delete_wddir(struct wddir* entry, int ininst_fd) {
-    	HASH_DEL(hashmap, entry);	/* entry: pointer to delete */
+    	HASH_DEL(hashmap, entry);		/* deletes entry from hashmap */
 	inotify_rm_watch(ininst_fd, entry->wd);	/* removes watch from inotify instance */
+	
+	free((void*)entry->path);		/* frees the heap allocated path */
 	free(entry);            
 }
 
@@ -113,8 +115,8 @@ int dir_scan_recursive(const char* base_path, int ininst_fd) {
 		
 		// Entry is a dir --> Add to kernel's inotify watch list
 		struct stat sb;
-		if (stat(entry_path, &sb) && S_ISDIR(sb.st_mode)) {
-			dir_scan_recursive(entry_path, ininst_fd);	
+		if (stat(entry_path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+			dir_scan_recursive(entry_path, ininst_fd);
 		}
 	}
 
@@ -125,27 +127,6 @@ int dir_scan_recursive(const char* base_path, int ininst_fd) {
 	return 0;
 }
 
-
-int full_read(int fd, char* buf, int n) {
-	size_t bytes_read = 0;
-
-	while (bytes_read < n) {
-		size_t result = read(fd, buf + bytes_read, n - bytes_read);
-
-		if (result < 0) {	// Error
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-
-		else if (result == 0)	// EOF
-			return -1;
-
-		bytes_read += result;
-	}
-	
-	return 0;
-}
 
 
 int main() {
@@ -167,26 +148,18 @@ int main() {
 	// ========================================================
 	// Drain and process all directory events --> Daemon task
 	// ========================================================
-	size_t event_size = sizeof(struct inotify_event);	
-	char buf[event_size + NAME_MAX + 1] = {0};
+	size_t event_size = sizeof(struct inotify_event) + NAME_MAX + 1;	// Enough space for event + file name + null terminator	
+	char ebuf[BATCH_COUNT * event_size] = {0};
 	while (1) {
-		// ENSURES FULL READ
-		int rc = full_read(ininst_fd, buf, event_size);
+		// inotify kernel subsystem requires the buffer & requested byte size to be atleast sizeof(struct inotify_event)
+		int rc = read(ininst_fd, ebuf, BATCH_COUNT * event_size);
 		if (rc < 0) {
 			// Syslog
 			break;
 		}
 
-		
-		uint32_t name_len = ((struct inotify_event*)buf)->len;
-		rc = full_read(ininst_fd, buf + event_size, name_len);
-		if (rc < 0) {
-			// Syslog
-			break;
-		}
-
-		// HANDLE EVENT
-		struct inotify_event* event = (struct inotify_event*)buf;
+		// HANDLE EVENTS
+		struct inotify_event* event = (struct inotify_event*)ebuf;
 		
 	}
 	
