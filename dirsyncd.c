@@ -1,24 +1,27 @@
-#define _POSIX_C_SOURCE >= 200809L // getline (posix func)
+#define _POSIX_C_SOURCE 200809L // getline (posix func from POSIX.1-2008 standard)
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/inotify.h>
-#include <sys/stat.h>
+#include <unistd.h>		// open() flags
+#include <fcntl.h>		// fcntl()
+#include <sys/inotify.h>	
+#include <limits.h>		// NAME_MAX / PATH_MAX
+#include <sys/stat.h>		// lstat()
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
 #include <stdint.h>
-#include <dirent.h>
+#include <dirent.h>		// opendir() / readdir()
 #include <time.h>
-#include <fnmatch.h>
+#include <fnmatch.h>		// fnmatch()
+#include <syslog.h>		// syslog()
 #include "dsync_hash.h"
 
+#define CONF_PATH  "/etc/dsync_blcklst.conf"
 #define WATCH_PATH "/home/matt/Projects"
 #define BACKUP_DIR ""
 
-#define BATCH_COUNT 100	// Amt of events that can be read from kernel at once
+#define EVENT_BATCH_COUNT 100	// Amt of events that can be read from kernel at once
 #define BLACKLIST_MAX 256
 
 
@@ -27,44 +30,20 @@ static uint32_t event_mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_M
 
 static volatile sig_atomic_t shutdown_requested = 0;
 
-static const char* blacklist[BLACKLIST_MAX];
+// Stores blacklisted patterns (Does not watch files/directories containing these patterns)
+static char* blacklist[BLACKLIST_MAX];
 static int blacklist_counter = 0;
 
-// ========================================================
-// Reads linux system file to find watch descriptor max
-// ========================================================
-/*
-int sys_wdmax() {
-	FILE* fp = fopen("/proc/sys/fs/inotify/max_user_watches", "r");
-	if (!fp)
-		return -1;
 
-	char buf[32] = {0};
-	if (!fgets(buf, 32, fp)) {
-		fclose(fp);
-		return -1;
-	}
 
-	char* end_ptr;
-	long int max_wd = strtol(buf, &end_ptr, 10);	// Base 10
-	// Invalid integer
-	if (end_ptr == buf || (*end_ptr != '\n' &&  *end_ptr != '\0')) {
-		fclose(fp);
-		return -1;
-	}
-
-	fclose(fp);
-	return (uint32_t)max_wd;
-}
-*/
 // ========================================================
 // Recursively add all sub dirs of path to inotifty watch
 // ========================================================
 
 int parse_config() {
-	FILE* fp = fopen("/etc/dirsyncd", "r");
+	FILE* fp = fopen(CONF_PATH, "r");
 	if (!fp) {
-		// syslog
+		syslog(LOG_ERR, "Unable to open dirsyncd config file: %m");
 		return -1;
 	}
 
@@ -112,16 +91,19 @@ int dir_scan_recursive(const char* base_path, int ininst_fd) {
 	DIR* dir = opendir(base_path);
 	
 	// Unable to open directory
-	if (!dir) 
+	if (!dir) {
+		syslog(LOG_ERR, "Error opening watch directory: %m");
 		return -1;
+	}
 
 	int wd = inotify_add_watch(ininst_fd, base_path, event_mask);
 	if (wd < 0) {
 		closedir(dir);
+		syslog(LOG_ERR, "Ran out of watch descriptors: %m");
 		return -1;
 	}
 
-	// Add entry to wddir_hm not already added
+	// Add entry to wddir_hm if not already added
 	if (!find_dir(wd))
         	add_wddir(wd, base_path);
 
@@ -161,13 +143,16 @@ int dir_scan_recursive(const char* base_path, int ininst_fd) {
 
 int safe_copy(const char* dest_path, const char* src_path) {
 	int src_fd = open(src_path, O_RDONLY);
-	if (src_fd < 0)
+	if (src_fd < 0) {
+		syslog(LOG_ERR, "Error opening files for copying: %m");
 		return -1;
+	}
 
 	// Equivalent to open() with flags: O_CREAT | O_TRUNC | O_WRONLY
 	// 0644 -> Permissions (Owner: read/write, Group/Others: read)
 	int dest_fd = creat(dest_path, 0644);
 	if (dest_fd < 0) {
+		syslog(LOG_ERR, "Error opening files for copying: %m");
 		close(src_fd);
 		return -1;
 	}
@@ -182,6 +167,7 @@ int safe_copy(const char* dest_path, const char* src_path) {
 				continue;
 			
 			// Error --> exist			
+			syslog(LOG_ERR, "Error reading file during copying: %m");
 			close(src_fd);
 			close(dest_fd);
 			return -1;
@@ -200,6 +186,7 @@ int safe_copy(const char* dest_path, const char* src_path) {
 					continue;
 				
 				// Write error
+				syslog(LOG_ERR, "Error writing file during copying: %m");
 				close(src_fd);
 				close(dest_fd);
 				return -1;
@@ -233,23 +220,17 @@ int main() {
 	sa.sa_handler = sys_shutdown_handler;
 	sigaction(SIGTERM, &sa, NULL);
 	
+	// Opens connection to system log
+	openlog(NULL, LOG_PID, LOG_DAEMON);
 
 	int ininst_fd = inotify_init();
 	if (ininst_fd < 0) {
-		// Log somewhere (errno available)
+		syslog(LOG_ERR, "Unable to create inotify instance: %m");
 		return -1;
 	}
 	
-	/*	
-	int max_wd = sys_wdmax();
-	if (max_wd < 0) {
-		// Syslog
-		return -1;
-	}	
-	*/
-
 	// Track dir and all sub dirs via linux kernel's inotify subsystem
-	dir_scan_recursive(WATCH_PATH, ininst_fd);	
+	dir_scan_recursive(WATCH_PATH, ininst_fd);
 
 	// ========================================================
 	// Drain and process all directory events --> Daemon task
@@ -257,13 +238,13 @@ int main() {
 
 	// Enough space for event + file name + null terminator	
 	size_t event_size = sizeof(struct inotify_event) + NAME_MAX + 1;
-	char ebuf[BATCH_COUNT * event_size];
+	char ebuf[EVENT_BATCH_COUNT * event_size];
 
 	while (!shutdown_requested) {
 		// inotify kernel subsystem requires the buffer & requested byte size to be atleast sizeof(struct inotify_event)
-		int length = read(ininst_fd, ebuf, BATCH_COUNT * event_size);
+		int length = read(ininst_fd, ebuf, EVENT_BATCH_COUNT * event_size);
 		if (length < 0) {
-			// Syslog
+			syslog(LOG_ERR, "Error while reading inotify events: %m");
 			break;
 		}
 		
@@ -352,7 +333,7 @@ int main() {
         			fcntl(ininst_fd, F_SETFL, def_flags | O_NONBLOCK);
 				
 				// Step 2: Drain event queue (read until empty / EAGAIN / EWOULDNOTBLOCK err)
-				while (read(ininst_fd, ebuf, BATCH_COUNT * event_size) > 0) {
+				while (read(ininst_fd, ebuf, EVENT_BATCH_COUNT * event_size) > 0) {
 					// Deliberately drain all events
 				}
 
@@ -363,7 +344,7 @@ int main() {
 				delete_all_wddir(ininst_fd);
 				
 				// Step 5: Rebuild inotify tracking tree
-				dir_scan_recursive(WATCH_PATH, ininst_fd);				
+				dir_scan_recursive(WATCH_PATH, ininst_fd);
 			}	
 		
 			i += sizeof(struct inotify_event) + event->len;
@@ -373,7 +354,9 @@ int main() {
 	delete_all_wddir(ininst_fd);	// Frees all wddir_hm entries & removes all watch descriptors from kernel's inotify instance
 	close(ininst_fd);		// Closes inotify instance
 	free_blacklist();
-	
+
+	// Closes connection to system log
+	closelog();
 	return 0;	
 }
 

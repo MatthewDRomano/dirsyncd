@@ -1,6 +1,12 @@
 #include "dsync_hash.h"
+#include <sys/inotify.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Hashmap definitions
+struct wddir* wddir_hm = NULL;
+struct cookie_event* cookie_event_hm = NULL; 
+
 
 // ========================================================
 // uthash.h hashmap ADD methods
@@ -37,7 +43,7 @@ struct cookie_event* find_event(uint32_t cookie) {
         struct cookie_event* event;
 
         HASH_FIND_INT(cookie_event_hm, &cookie, event);
-        return entry;
+        return event;
 }
 
 // ========================================================
@@ -72,6 +78,6 @@ void delete_all_cookie_event() {
         struct cookie_event *current_entry, *tmp;
         HASH_ITER(hh, cookie_event_hm, current_entry, tmp) {
                 delete_cookie_event(current_entry);
-        {
+        }
 }
 

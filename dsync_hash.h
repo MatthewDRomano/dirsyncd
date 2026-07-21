@@ -22,10 +22,10 @@ struct cookie_event {
 };
 
 // Global wddir hashmap
-struct wddir* wddir_hm = NULL;
+extern struct wddir* wddir_hm;
         
 // Global cookie event hashmap  
-struct cookie_event* cookie_event_hm = NULL;
+extern struct cookie_event* cookie_event_hm;
 
 
 
