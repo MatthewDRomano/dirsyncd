@@ -14,10 +14,9 @@ struct wddir {
 // Hashable structure
 struct cookie_event {
         uint32_t cookie;        // key
-        uint64_t timestamp;     // value #1
-        int wd;                 // value #2
-        uint32_t mask;          // value #3
-        const char* path;       // value #4
+        int wd;                 // value #1
+	uint32_t mask;
+	const char* name;
         UT_hash_handle hh;      // Makes structure hashable via uthash
 };
 
@@ -35,11 +34,11 @@ extern struct cookie_event* cookie_event_hm;
 
 // Key: watch desriptor 
 // Value(s): file path
-void add_wddir(int wd, const char* path);
+void hm_add_wddir(int wd, const char* path);
 
 // Key: inotify_event cookie
 // Value(s): watch descriptor, event bitmask, file path
-void add_cookie_event(uint32_t cookie, int wd, uint32_t mask, const char* path);
+void hm_add_cookie_event(uint32_t cookie, int wd, uint32_t mask, const char* name);
 
 
 
@@ -48,10 +47,10 @@ void add_cookie_event(uint32_t cookie, int wd, uint32_t mask, const char* path);
 // ========================================================
 
 // Indexes wddir hashmap
-struct wddir* find_dir(int wd_key);
+struct wddir* hm_find_dir(int wd_key);
 
 // Indexes cookie_event hashmap
-struct cookie_event* find_event(uint32_t cookie);
+struct cookie_event* hm_find_event(uint32_t cookie);
 
 
 
@@ -61,16 +60,16 @@ struct cookie_event* find_event(uint32_t cookie);
 
 // Deletes wddir hashmap entry
 // Frees watch descriptor from inotify instance via ininst_fd
-void delete_wddir(struct wddir* entry, int ininst_fd);
+void hm_delete_wddir(struct wddir* entry, int ininst_fd);
 
 // Deletes cookie_event hashmap entry
-void delete_cookie_event(struct cookie_event* entry);
+void hm_delete_cookie_event(struct cookie_event* entry);
        
 // Deletes ALL wddir hashmap entries 
 // Frees ALL watch descriptors from inotify instance via ininst_fd
-void delete_all_wddir(int ininst_fd);
+void hm_delete_all_wddir(int ininst_fd);
        
 // Deletes ALL cookie_event hashmap entries 
-void delete_all_cookie_event();
+void hm_delete_all_cookie_event();
 
 #endif
