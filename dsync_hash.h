@@ -38,7 +38,7 @@ void hm_add_wddir(int wd, const char* path);
 
 // Key: inotify_event cookie
 // Value(s): watch descriptor, event bitmask, file path
-void hm_add_cookie_event(uint32_t cookie, int wd, uint32_t mask, const char* name);
+void hm_add_cookie_event(uint32_t cookie_key, int wd, uint32_t mask, const char* name);
 
 
 
@@ -47,10 +47,10 @@ void hm_add_cookie_event(uint32_t cookie, int wd, uint32_t mask, const char* nam
 // ========================================================
 
 // Indexes wddir hashmap
-struct wddir* hm_find_dir(int wd_key);
+struct wddir* hm_find_wddir(int wd_key);
 
 // Indexes cookie_event hashmap
-struct cookie_event* hm_find_event(uint32_t cookie);
+struct cookie_event* hm_find_cookie_event(uint32_t cookie_key);
 
 
 
@@ -60,16 +60,20 @@ struct cookie_event* hm_find_event(uint32_t cookie);
 
 // Deletes wddir hashmap entry
 // Frees watch descriptor from inotify instance via ininst_fd
-void hm_delete_wddir(struct wddir* entry, int ininst_fd);
+void hm_delete_wddir(struct wddir* entry, int ininst_fd, int rmwatch);
 
 // Deletes cookie_event hashmap entry
 void hm_delete_cookie_event(struct cookie_event* entry);
        
 // Deletes ALL wddir hashmap entries 
 // Frees ALL watch descriptors from inotify instance via ininst_fd
-void hm_delete_all_wddir(int ininst_fd);
+void hm_delete_all_wddir(int ininst_fd, int rmwatch);
        
 // Deletes ALL cookie_event hashmap entries 
 void hm_delete_all_cookie_event();
+
+// Removes a directory and all of its subdirectories from the hashmap and inotify instance(s)
+// Takes in null terminated path
+void hm_delete_tree_wddir(const char* root_path, int ininst_fd);
 
 #endif

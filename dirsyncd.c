@@ -20,7 +20,7 @@
 #define DSYNC_WARNING -2
 #define DSYNC_ERROR   -3
 
-#define CONF_PATH  "/etc/dsync_blcklst.conf"
+#define CONF_PATH  "/etc/dirsyncd.conf"
 #define WATCH_PATH "/home/matt/Projects"
 #define BACKUP_DIR "/mnt/SharedDrive"
 
@@ -38,9 +38,9 @@ static char* blacklist[BLACKLIST_MAX];
 static int blacklist_counter = 0;
 
 
-
 // ========================================================
-// Recursively add all sub dirs of path to inotifty watch
+// Parse system config file
+//	|-> Finds user-set blacklisted file/dir patterns
 // ========================================================
 
 int parse_config() {
@@ -69,6 +69,11 @@ int parse_config() {
 		if (line[0] == '\0' || line[0] == '#')
 			continue;
 	
+		// Remove trailing forward slash for standardized directory name pattern matching
+		size_t len = strlen(line);
+		if (line[len - 1] == '/')
+			line[len - 1] = '\0';
+	
 		char* entry = strdup(line);
 		if (!entry) {
 			syslog(LOG_WARNING, "strdup() failure during config parse: %m");
@@ -84,11 +89,15 @@ int parse_config() {
 	return 0;
 }
 
+// Free heap allocated blacklisted patterns
 void free_blacklist() {
 	for (int i = 0; i < blacklist_counter; i++)
 		free(blacklist[i]);
 }
 
+// ========================================================
+// Recursively add all sub dirs of path to inotify watch
+// ========================================================
 	
 int dir_scan_recursive(const char* base_path, int ininst_fd) {
 	DIR* dir = opendir(base_path);
@@ -116,7 +125,7 @@ int dir_scan_recursive(const char* base_path, int ininst_fd) {
 	}
 
 	// Add entry to wddir_hm if not already added
-	if (!hm_find_dir(wd))
+	if (!hm_find_wddir(wd))
         	hm_add_wddir(wd, base_path);
 
 	struct dirent* entry;
@@ -156,15 +165,24 @@ int safe_copy(const char* dest_path, const char* src_path) {
 		return DSYNC_WARNING;
 	}
 
+	// Copy src file perms for dest file
+	struct stat sb;
+	if (lstat(src_path, &sb) != 0) {
+		syslog(LOG_WARNING, "Error w/ lstat() during copy: %m");
+        	close(src_fd);
+	        return DSYNC_WARNING
+	}
+
 	// Equivalent to open() with flags: O_CREAT | O_TRUNC | O_WRONLY
-	// 0644 -> Permissions (Owner: read/write, Group/Others: read)
-	int dest_fd = creat(dest_path, 0644);
+	int dest_fd = creat(dest_path, 0600);
 	if (dest_fd < 0) {
 		syslog(LOG_WARNING, "Error opening files for copying: %m");
 		close(src_fd);
 		return DSYNC_WARNING;
 	}
 	
+	// Ensure the source files permissions cary over --> overrides umask
+	fchmod(dest_fd, 0777 & sb.st_mode);
 
 	// Stops reading on EOF or error
 	char cpy_buf[8192]; // 8KB page buffer
@@ -228,7 +246,7 @@ int backup_new_file(struct wddir* watched_dir, struct inotify_event* event) {
 
 // Takes a watched directory, and an event struct
 // The passed event mask should contain IN_CREATE & IN_ISDIR
-int backup_and_watch_dir(int ininst_fd, struct wddir* watched_dir, struct inotify_event* event) {
+int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct inotify_event* event) {
 	if (!(event->mask & IN_CREATE) || !(event->mask & IN_ISDIR))
 		return -1;
 
@@ -272,36 +290,36 @@ int backup_and_watch_dir(int ininst_fd, struct wddir* watched_dir, struct inotif
 
 // After specified poll() timeout, treat unmatched IN_MOVE_FROM events as deletions
 void handle_unmatched_movefrom_events(int ininst_fd) {
-	// Iterate through the cookie : event hashmap
-	struct cookie_event* event = cookie_event_hm;
-	while (event != NULL) {	
-		struct wddir* watched_dir = hm_find_dir(event->wd);
-		
+	struct cookie_event *current_event, *tmp;
+	
+	HASH_ITER(hh, cookie_event_hm, current_event, tmp) {	
+		struct wddir* watched_dir = hm_find_wddir(current_event->wd);
+		char backup_path[PATH_MAX];
+		snprintf(backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, current_event->name);		
+
+		int rc;
 		// Delete directory     
-        	if (event->mask & IN_ISDIR) {
-                	char backup_path[PATH_MAX];
-                	snprintf(backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, event->name);
-  			
-                	hm_delete_wddir(watched_dir, ininst_fd);   
-                	rmdir(backup_path);
+        	if (current_event->mask & IN_ISDIR) {
+			// Remove from hashmap & inotify instance (specified by 1)
+                	hm_delete_wddir(watched_dir, ininst_fd, 1);   
+                	rc = rmdir(backup_path);
         	}
 
         	// Delete file
-        	else {
-                	char backup_path[PATH_MAX];
-                	snprintf(backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, event->name);
+        	else
+                	rc = unlink(backup_path);
+	
+		// Log removal error	
+		if (rc != 0) 
+			syslog(LOG_WARNING "Unable to remove file/dir: %m");
 
-                	unlink(backup_path);
-        	}
-		
-		// Remove the IN_MOVED_FROM event from the hashmap, iterate to next
-		struct cookie_event* prev = event;
-		event = event->hh.next;
-		hm_delete_cookie_event(prev);
+		// Remove the IN_MOVED_FROM event from the hashmap
+		hm_delete_cookie_event(current_event);
 	}
 }
 
 
+// SIGTERM handler for graceful shutdown
 void sys_shutdown_handler(int sig) {
 	(void)sig;
 	shutdown_requested = 1;
@@ -371,7 +389,7 @@ int main() {
 
 			syslog(LOG_ERR, "Poll() error: %m");
 			return_status = -1;
-			goto run_err_cleanup;
+			break;
 		}
 
 		// Poll timedout --> no events are present
@@ -387,7 +405,7 @@ int main() {
 		if (length < 0) {
 			syslog(LOG_ERR, "Error while reading inotify events: %m");
 			return_status = -1;
-			goto run_err_cleanup;
+			break;
 		}
 		
 
@@ -395,23 +413,32 @@ int main() {
 		int i = 0;
 		while (i < length) {
 			struct inotify_event* event = (struct inotify_event*)(ebuf + i);
-			struct wddir* watched_dir = hm_find_dir(event->wd);
-
+		
+			// Set to NULL with IN_Q_OVERFLOW event as event->wd == -1
+			struct wddir* watched_dir = hm_find_wddir(event->wd);
+			
 			// Ignore the entry if it matches a blacklisted pattern
 			// Leading periods MUST be explicitly put in the blacklisted pattern
-			for (int j = 0; j < blacklist_counter; j++)
-				if (fnmatch(blacklist[j], event->name, FNM_PERIOD) == 0) {
-					i += sizeof(struct inotify_event) + event->len;
-					continue;
-				}
-					
+			int skip_event = 0;
+			if (event->len > 0)
+				for (int j = 0; j < blacklist_counter; j++)
+					if (fnmatch(blacklist[j], event->name, FNM_PERIOD) == 0) {
+						i += sizeof(struct inotify_event) + event->len;
+						skip_event = 1;
+						break;
+					}
+				
+			// File or Dir name matches blacklisted pattern	
+			if (skip_event)
+				continue;
+
 			// ========================================================
         		// Process events on valid entries
         		// ========================================================
 	
 			// Folder is created (Ignore file creation)
 			if (event->mask & IN_CREATE && event->mask & IN_ISDIR) {
-				backup_and_watch_dir(ininst_fd, watched_dir, event);
+				backup_and_watch_new_dir(ininst_fd, watched_dir, event);
 			}
 
 			// File is closed after a write (Also triggered right after creation)
@@ -423,17 +450,22 @@ int main() {
 				char backup_path[PATH_MAX];
                                	snprintf(backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, event->name);
 					
-				unlink(backup_path);
+				if (unlink(backup_path) != 0)
+					syslog(LOG_WARNING, "Error unlinking file: %m");
 			}
 
 			// Directory is deleted
 			// Linux behavior guarantees all subcontents are deleted (Files via IN_DELETE subdirs via IN_DELETE_SELF)
-			else if (event->mask & IN_DELETE_SELF && event->mask & IN_ISDIR) {
+			else if (event->mask & IN_DELETE_SELF) {
 				char backup_path[PATH_MAX];
 				snprintf(backup_path, PATH_MAX, "%s%s", BACKUP_DIR, watched_dir->path);
 
-				hm_delete_wddir(watched_dir, ininst_fd);
-				rmdir(backup_path);
+				// Remove from hashmap
+				// Do not call inotify_rm_watch() as kernel has done so for us (specified by 0 below)
+				hm_delete_wddir(watched_dir, ininst_fd, 0);
+				
+				if (rmdir(backup_path) != 0)
+					syslog(LOG_WARNING, "Error removing fir: %m");
 			}
 
 			// 'Move from' event
@@ -444,32 +476,65 @@ int main() {
 			}
 
 			// 'Move to' event
-			// File is either moved into watched directory or renamed (always triggered AFTER a move from event)
+			// File/folder is either moved into watched directory or renamed (always triggered AFTER a move from event)
 			else if (event->mask & IN_MOVED_TO) {
+				
 				// Hashmap entry corresponding to a IN_MOVED_FROM event is found 
-				// This IN_MOVED_FROM and IN_MOVED_TO pair means a rename occured
-				struct cookie_event* entry;
-				if ((entry = hm_find_event(event->cookie))) {
-					// Rename the file and remove entry from hashmap
-					char old_path[PATH_MAX], new_path[PATH_MAX];
-					snprintf(old_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, entry->name);
-					snprintf(new_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, event->name);
-					rename(old_path, new_path);		
+				// Rename occured
+				struct cookie_event* mvf_event;
+				if ((mvf_event = hm_find_cookie_event(event->cookie))) {
+		
+					// 1.) Rename the backup file/folder
+					char old_backup_path[PATH_MAX], new_backup_path[PATH_MAX];
+					snprintf(old_backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, mvf_event->name);
+					snprintf(new_backup_path, PATH_MAX, "%s%s/%s", BACKUP_DIR, watched_dir->path, event->name);
+					rename(old_backup_path, new_backup_path);		
 					
-					hm_delete_cookie_event(entry);
+					// 2.) Remove the entry from the IN_MOVED_FROM cache (hashmap)
+					hm_delete_cookie_event(mvf_event);
+
+					// 3.) Handle hashmap stale paths for renamed directories
+					if (event->mask & IN_ISDIR) {
+						char old_watched_path[PATH_MAX], new_watched_path[PATH_MAX];
+						
+						// Construct absolute paths for the watched directories
+            					snprintf(old_watched_path, PATH_MAX, "%s/%s", watched_dir->path, mvf_event->name);
+            					snprintf(new_watched_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
+	
+						// Nuke the old hashmap state and rebuild w/ updated paths 
+						// Unadds and readds inotify watch descriptors
+						hm_delete_tree_wddir(old_watched_path, ininst_fd);
+						dir_scan_recursive(new_watched_path, ininst_fd);
+					}
 				}
 			
 				// File/Dir was moved from an unwatched directory
-				// treat as creation
+				// Treat as creation
 				else {
 					// Dir creation --> add to inotify watch
 					if (event->mask & IN_ISDIR) 
-						backup_and_watch_dir(ininst_fd, watched_dir, event);
+						backup_and_watch_new_dir(ininst_fd, watched_dir, event);
 					else
 						backup_new_file(watched_dir, event);	
 				}	
 			}
 
+			/* Handles root watch-directory renames / moves
+			 * CRITICAL EVENT: nuke the wddir hashmap and inotify watch instances
+			  	* Exit process and force the user to update the config file with new watch path 
+			  	* Restart daemon to resume proper behavior
+			*/
+			else if (event->mask & IN_MOVE_SELF) {
+				// Confirms the root was moved/renamed --> Nuke hashmap
+				if (strcmp(watched_dir->path, WATCHED_PATH) == 0) {
+					syslog(LOG_CRIT, "Root watch path altered: UPDATE CONF. & RESTART");
+	
+					// Breaks out of event read loop --> then fails outer while loop eval
+					shutdown_requested = 1;
+					break;	
+				}
+			}
+	
 			// Kernel overflowed with events
 			else if (event->mask & IN_Q_OVERFLOW) {
 				// Step 1: Force the fd into non-blocking mode to safely drain it
@@ -486,8 +551,12 @@ int main() {
 				fcntl(ininst_fd, F_SETFL, def_flags);
 				
 				// Step 4: Clear current inotify tracking tree
-				hm_delete_all_wddir(ininst_fd);
+				// Clears hashmap and inotify wds
+				hm_delete_all_wddir(ininst_fd, 1);
 				
+				// Step 4.5: Also clear the IN_MOVED_FROM hashmap (event cache)
+				hm_delete_all_cookie_event();
+
 				// Step 5: Rebuild inotify tracking tree
 				dir_scan_recursive(WATCH_PATH, ininst_fd);
 
@@ -495,22 +564,24 @@ int main() {
 				break;
 			}
 
-			// Watched directory was unmounted --> remove from hashmap			
+			// Watched directory was unmounted --> remove from hashmap
 			else if (event->mask & IN_UNMOUNT) {
-				syslog(LOG_NOTICE, "Dir unmounted: %s/%s", watched_dir->path, event->name);
-				hm_delete_wddir(watched_dir, ininst_fd);
+				syslog(LOG_NOTICE, "Dir unmounted: %s", watched_dir->path);
+				
+				// Do not call inotify_rm_watch(): '0'  --> wd was already removed by kernel
+				hm_delete_wddir(watched_dir, ininst_fd, 0);
 			}
 
-			// Ignore IN_IGNORED	
+			// Ignore IN_IGNORED --> Respective behavior/cleanup is handled by other events	
 		
 			i += sizeof(struct inotify_event) + event->len;
 		}	
 	}
 
 	run_err_cleanup:
-	hm_delete_all_wddir(ininst_fd);	// Frees all wddir_hm entries & removes all watch descriptors from kernel's inotify instance
-	hm_delete_all_cookie_event();	// Frees all cookie_event entries
-	close(ininst_fd);		// Closes inotify instance
+	hm_delete_all_wddir(ininst_fd, 1);	// Frees all wddir_hm entries & removes all wd from kernel's inotify instance
+	hm_delete_all_cookie_event();		// Frees all cookie_event entries
+	close(ininst_fd);			// Closes inotify instance
 	free_blacklist();
 
 	// Closes connection to system log
