@@ -34,11 +34,11 @@ extern struct cookie_event* cookie_event_hm;
 
 // Key: watch desriptor 
 // Value(s): file path
-void hm_add_wddir(int wd, const char* path);
+int hm_add_wddir(int wd, const char* path);
 
 // Key: inotify_event cookie
 // Value(s): watch descriptor, event bitmask, file path
-void hm_add_cookie_event(uint32_t cookie_key, int wd, uint32_t mask, const char* name);
+int hm_add_cookie_event(uint32_t cookie_key, int wd, uint32_t mask, const char* name);
 
 
 
@@ -74,6 +74,6 @@ void hm_delete_all_cookie_event();
 
 // Removes a directory and all of its subdirectories from the hashmap and inotify instance(s)
 // Takes in null terminated path
-void hm_delete_tree_wddir(const char* root_path, int ininst_fd);
+void hm_delete_tree_wddir(const char* root_path, int ininst_fd, int rmwatch);
 
 #endif

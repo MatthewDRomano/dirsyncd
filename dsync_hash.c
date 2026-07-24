@@ -2,6 +2,7 @@
 #include <sys/inotify.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 // Hashmap definitions
 struct wddir* wddir_hm = NULL;
@@ -12,21 +13,44 @@ struct cookie_event* cookie_event_hm = NULL;
 // uthash.h hashmap ADD methods
 // ========================================================
 
-void hm_add_wddir(int wd_key, const char* path) {
+int hm_add_wddir(int wd_key, const char* path) {
         struct wddir* entry = (struct wddir*)malloc(sizeof *entry);
+	if (!entry) {
+		syslog(LOG_ERR, "Error allocating memory for wddir hashmap entry: %m");
+		return -1;
+	}
+
         entry->wd = wd_key;
         entry->path = strdup(path);             /* Copy path to the heap */
+        if (!entry->path) {
+		syslog(LOG_ERR, "Error allocating memory for wddir hashmap entry fields: %m");
+		free(entry);
+		return -1;
+	}
+
         HASH_ADD_INT(wddir_hm, wd, entry);      /* wd: name of key field */
+	return 0;
 }
 
-void hm_add_cookie_event(uint32_t cookie_key, int wd, uint32_t mask, const char* name) {
+int hm_add_cookie_event(uint32_t cookie_key, int wd, uint32_t mask, const char* name) {
         struct cookie_event* entry = (struct cookie_event*)malloc(sizeof *entry);
+	if (!entry) {
+		syslog(LOG_ERR, "Error allocating memory for cookie_event hashmap entry: %m");
+		return -1;
+	}
+
         entry->cookie = cookie_key;
         entry->wd = wd;
 	entry->mask = mask;
-	entry->name = strdup(name);					/* Copy name to the heap */	
-	
+	entry->name = strdup(name);		/* Copy name to the heap */	
+	if (!entry->name) {
+		syslog(LOG_ERR, "Error allocating memory for cookie_event hashmap entry fields: %m");
+		free(entry);
+		return -1;
+	}	
+
         HASH_ADD(hh, cookie_event_hm, cookie, sizeof(uint32_t), entry); /* cookie: name of key field */
+	return 0;
 }
 
 // ========================================================
@@ -52,6 +76,9 @@ struct cookie_event* hm_find_cookie_event(uint32_t cookie_key) {
 // ========================================================
 
 void hm_delete_wddir(struct wddir* entry, int ininst_fd, int rmwatch) {
+	if (!entry)
+		return;
+
 	// removes watch from inotify instance if specified
         if (rmwatch)
 		inotify_rm_watch(ininst_fd, entry->wd); 
@@ -62,8 +89,10 @@ void hm_delete_wddir(struct wddir* entry, int ininst_fd, int rmwatch) {
 }
 
 void hm_delete_cookie_event(struct cookie_event* entry) {
-        HASH_DEL(cookie_event_hm, entry);
+        if (!entry)
+		return;
 
+	HASH_DEL(cookie_event_hm, entry);
 	free((void*)entry->name);
         free(entry);
 }
@@ -84,7 +113,7 @@ void hm_delete_all_cookie_event() {
         }
 }
 
-void hm_delete_tree_wddir(const char* root_path, int ininst_fd) {
+void hm_delete_tree_wddir(const char* root_path, int ininst_fd, int rmwatch) {
 	struct wddir *current_wddir, *tmp;
 	size_t root_path_len = strlen(root_path);
 
@@ -94,8 +123,8 @@ void hm_delete_tree_wddir(const char* root_path, int ininst_fd) {
 		if (strncmp(current_wddir->path, root_path, root_path_len) == 0 &&
 		   (current_wddir->path[root_path_len] == '\0' || current_wddir->path[root_path_len] == '/'))
 			
-			// 1 indicates inotify_rm_watch() will be called
-			hm_delete_wddir(current_wddir, ininst_fd, 1);		
+			// Nonzero rmwatch indicates inotify_rm_watch() will be called
+			hm_delete_wddir(current_wddir, ininst_fd, rmwatch);		
 	}
 }
 
