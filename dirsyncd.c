@@ -44,7 +44,6 @@ static const char* wroot_keyword = "WATCH_PATH=";
 static const char* broot_keyword = "BACKUP_PATH=";
 
 
-
 // Free heap allocated blacklisted patterns
 void free_blacklist() {
         for (int i = 0; i < blacklist_counter; i++)
@@ -120,7 +119,7 @@ int parse_config() {
 			if (!backup_root) {
 				tmp = strdup(line + keylen);
 				if (!tmp) {
-					syslog(LOG_ERR, "Error allocating memory for watch_root: %m");
+					syslog(LOG_ERR, "Error allocating memory for backup_root: %m");
 					goto err_inv_parse;
 				}
 
@@ -203,11 +202,47 @@ int parse_config() {
 }
 
 
+// Returns a pointer to the relative path fragment inside abs_path by stripping 
+// the leading watch_root or backup_root prefix. Returns "" if abs_path is the root itself, 
+// or NULL if it falls under neither. 
+// Do NOT free() the returned pointer; it aliases abs_path and shares its lifetime.
+const char* constr_rel_path(const char* abs_path) {
+	int wroot_path_len = strlen(watch_root);
+	int broot_path_len = strlen(backup_root);
+
+	// The absolute path is a watched directory
+	if (strncmp(abs_path, watch_root, wroot_path_len) == 0) {
+		const char* rel_path = abs_path + wroot_path_len;
+		if (*rel_path  == '/')
+			return rel_path + 1;
+
+		else if (*rel_path == '\0')
+			return rel_path;
+
+		// else: false-positive prefix match (e.g. "/data_backup" vs "/data") -- fall through
+	}
+
+	// The absolute path is a backup directory
+	if (strncmp(abs_path, backup_root, broot_path_len) == 0) {
+		const char* rel_path = abs_path + broot_path_len;
+		if (*rel_path == '/')
+			return rel_path + 1;
+		
+		else if (*rel_path == '\0')
+			return rel_path;
+
+		// else: same false positive fall through behavior as above
+	}
+
+	return NULL;
+}
+
+
 // ========================================================
 // Recursively add all sub dirs of path to inotify watch
 // ========================================================
 	
-int scan_watch_tree(const char* base_path, int ininst_fd) {
+int watch_tree(const char* base_path, int ininst_fd) {
 	DIR* dir = opendir(base_path);
 	
 	// Unable to open directory
@@ -235,7 +270,7 @@ int scan_watch_tree(const char* base_path, int ininst_fd) {
 		if (errno == ENOSPC)
 			syslog(LOG_ERR, "Out of inotify watch descriptors (fs.inotify.max_user_watches) -- aborting scan: %m");
 		else
-			syslog(LOG_WARNING, "Unable to watch directory: %m");
+			syslog(LOG_WARNING, "Unable to add directory to watch: %m");
 
 		return (errno == ENOSPC) ? DSYNC_ERROR : DSYNC_WARNING;
 	}
@@ -259,11 +294,17 @@ int scan_watch_tree(const char* base_path, int ininst_fd) {
 		char entry_path[PATH_MAX];
                 snprintf(entry_path, PATH_MAX, "%s/%s", base_path, entry->d_name);
 		
-		// Entry is a dir --> Add to kernel's inotify watch list
 		// lstat() does not follow symlinks
 		struct stat sb;
-		if (lstat(entry_path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-			int child_rc = scan_watch_tree(entry_path, ininst_fd);
+		if (lstat(entry_path, &sb) != 0) {
+			syslog(LOG_WARNING, "lstat() failure while scanning dir: %m");
+			scan_rc = DSYNC_WARNING;
+			continue;
+		}
+	
+		// Entry is a dir --> Add to kernel's inotify watch list
+		if (S_ISDIR(sb.st_mode)) {
+			int child_rc = watch_tree(entry_path, ininst_fd);
 					
 			if (child_rc == DSYNC_ERROR) {
 				scan_rc = DSYNC_ERROR; 
@@ -272,10 +313,8 @@ int scan_watch_tree(const char* base_path, int ininst_fd) {
 			
 			else if (child_rc == DSYNC_WARNING)
 				scan_rc = DSYNC_WARNING;	
-		}
 		
-		else
-			syslog(LOG_WARNING, "lstat() failure: %m");
+		}
 	}
 
 	// Directory layer is fully traversed
@@ -286,12 +325,13 @@ int scan_watch_tree(const char* base_path, int ininst_fd) {
 
 // ========================================================
 // Safely copies file contents from one file to another
+// 	|-> Creates file if dest_path doesn't exist
 // ========================================================
 
 int safe_copy(const char* dest_path, const char* src_path) {
 	int src_fd = open(src_path, O_RDONLY);
 	if (src_fd < 0) {
-		syslog(LOG_WARNING, "Error opening files for copying: %m");
+		syslog(LOG_WARNING, "Error opening src file for copying (%s): %m", src_path);
 		return DSYNC_WARNING;
 	}
 
@@ -306,7 +346,7 @@ int safe_copy(const char* dest_path, const char* src_path) {
 	// Equivalent to open() with flags: O_CREAT | O_TRUNC | O_WRONLY
 	int dest_fd = creat(dest_path, 0600);
 	if (dest_fd < 0) {
-		syslog(LOG_WARNING, "Error opening files for copying: %m");
+		syslog(LOG_WARNING, "Error opening dest file for copying(%s): %m", dest_path);
 		close(src_fd);
 		return DSYNC_WARNING;
 	}
@@ -357,20 +397,8 @@ int safe_copy(const char* dest_path, const char* src_path) {
 	return 0;
 }
 
-// Takes a watched directory, and an event struct
-// Creates new file, backs up all contents
-int backup_new_file(struct wddir* watched_dir, struct inotify_event* event) {
-	char file_path[PATH_MAX];
-        snprintf(file_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
 
-        char backup_path[PATH_MAX];
-        snprintf(backup_path, PATH_MAX, "%s/%s/%s", backup_root, watched_dir->path, event->name);
-
-        // Safely copies contents into backup directory
-	return safe_copy(backup_path, file_path);
-}
-
-// Takes a watched directory, and an event struct
+// Takes a newly IN_MOVED_IN directory, and the corresponding event struct
 // The passed event mask should contain IN_CREATE & IN_ISDIR
 int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct inotify_event* event) {
 	if (!(event->mask & IN_CREATE) || !(event->mask & IN_ISDIR))
@@ -402,7 +430,7 @@ int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct in
         	
 		// use mkdir to copy dir w/ same permissions
                 char backup_path[PATH_MAX];
-                snprintf(backup_path, PATH_MAX, "%s/%s/%s", backup_root, watched_dir->path, event->name);
+                snprintf(backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(new_dir_path));
 
                 // Explicitly apply permissions via chmod to override the system umask
                 mode_t target_mode = dir_stat.st_mode & 0777;
@@ -423,6 +451,81 @@ int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct in
 	}
 
 	return 0;
+}
+
+
+// Recursively backs up the files/directories in watch_path's subtree to backup_path
+int backup_tree(const char* backup_path, const char* watch_path) {
+	
+	// Ensure watch_path is a valid directory
+	struct stat sb;
+	if (lstat(watch_path, &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+		syslog(LOG_WARNING, "lstat() failure backing up moved-in dir tree: %m");
+		return DSYNC_WARNING;
+	}
+
+	// Check if watch_path is blacklisted
+	const char* base_name = strrchr(watch_path, '/');                // sets pointer to last occurence of '/'
+        base_name = (base_name) ? base_name + 1 : watch_path;
+
+        for (int i = 0; i < blacklist_counter; i++)
+                if (fnmatch(blacklist[i], base_name, FNM_PERIOD) == 0)
+                        return 0;
+
+	// Backup the directory
+	mode_t target_mode = sb.st_mode & 0777;
+	if (mkdir(backup_path, target_mode) == 0)
+		chmod(backup_path, target_mode);
+	else {
+		syslog(LOG_WARNING, "mkdir() failure backing up moved-in tree: %m");
+		return DSYNC_WARNING;
+	}
+
+
+	// Begin recursively backup up directory subtree
+	DIR* dir = opendir(watch_path);
+	if (!dir) {
+		syslog(LOG_WARNING, "opendir() failure backing up moved-in tree: %m");
+		return DSYNC_WARNING;
+	}
+
+	struct dirent* entry;
+	int scan_rc = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		// Skip . and ..
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		
+		char child_watch_path[PATH_MAX], child_backup_path[PATH_MAX];
+		snprintf(child_watch_path,  PATH_MAX, "%s/%s", watch_path, entry->d_name);
+		snprintf(child_backup_path, PATH_MAX, "%s/%s", backup_path, entry->d_name);
+
+		struct stat child_sb;
+		if (lstat(child_watch_path, &child_sb) == 0) {
+			// Child is dir
+			if (S_ISDIR(child_sb.st_mode)) {
+				if (backup_tree(child_backup_path, child_watch_path) != 0)
+					scan_rc = DSYNC_WARNING;
+			}
+	
+			// Child is file
+			else {
+				if (safe_copy(child_backup_path, child_watch_path) != 0) {
+					syslog(LOG_WARNING, "Fail to copy child within moved-in tree");
+					scan_rc = DSYNC_WARNING;
+				}
+			}
+		}
+
+		else {
+			syslog(LOG_WARNING, "lstat() failure on child backup within move-in tree: %m");
+			scan_rc = DSYNC_WARNING;
+		}
+
+	}
+
+	closedir(dir);
+	return scan_rc;
 }
 
 
@@ -447,10 +550,11 @@ int remove_backup_tree(const char* base_path) {
 		struct stat sb;
 		if (lstat(child_path, &sb) == 0) {
 			// Recursively remove subtree if entry is a dir		
-			if (S_ISDIR(sb.st_mode))
+			if (S_ISDIR(sb.st_mode)) {
 				if (remove_backup_tree(child_path) != 0)
 					rc = DSYNC_WARNING;	
-		
+			}		
+
 			// Otherwise file --> remove
 			else {
 				if (unlink(child_path) != 0) {
@@ -493,24 +597,23 @@ void handle_unmatched_movefrom_events(int ininst_fd) {
 			continue;
 		}
 
-		char backup_path[PATH_MAX];
-		snprintf(backup_path, PATH_MAX, "%s/%s/%s", backup_root, watched_dir->path, current_event->name);		
+		char child_watch_path[PATH_MAX], child_backup_path[PATH_MAX];
+		snprintf(child_watch_path,  PATH_MAX, "%s/%s", watched_dir->path, current_event->name);
+		snprintf(child_backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(child_watch_path));		
 
 		int rc;
 		// Delete directory recursively
         	if (current_event->mask & IN_ISDIR) {
-                	char child_path[PATH_MAX];
-			snprintf(child_path, PATH_MAX, "%s/%s", watched_dir->path, current_event->name);
 			
 			// Remove dir subtree from hashmap & inotify instance (specified by 1)
 			// hm_delete_tree_wddir allows access/deletion via path
-			hm_delete_tree_wddir(child_path, ininst_fd, 1);   
-                	rc = remove_backup_tree(backup_path);
+			hm_delete_tree_wddir(child_watch_path, ininst_fd, 1);   
+                	rc = remove_backup_tree(child_backup_path);
         	}
 
         	// Delete file
         	else
-                	rc = unlink(backup_path);
+                	rc = unlink(child_backup_path);
 	
 		// Log removal error	
 		if (rc != 0) 
@@ -538,10 +641,11 @@ int main() {
 	sa.sa_handler = sys_shutdown_handler;
 	sigaction(SIGTERM, &sa, NULL);
 	
-	// Opens connection to system log
-	openlog(NULL, LOG_PID, LOG_DAEMON);
+	// Opens connection to system log --> "dirsyncd" in red is prepended to all syslog messages
+	openlog("\033[31mdirsyncd\033[0m", LOG_PID, LOG_DAEMON);
 
-	int ininst_fd = inotify_init();
+	// Initialize inotify instance w/ nonblocking fd for event reads
+	int ininst_fd = inotify_init1(IN_NONBLOCK);
 	if (ininst_fd < 0) {
 		syslog(LOG_ERR, "Unable to create inotify instance: %m");
 		closelog();
@@ -558,7 +662,7 @@ int main() {
 	
 	// Recursively scan and track all subdirectories in watch_root
 	// Builds the inotify watch tree
-	if (scan_watch_tree(watch_root, ininst_fd) == DSYNC_ERROR) {
+	if (watch_tree(watch_root, ininst_fd) == DSYNC_ERROR) {
 		closelog();
 		close(ininst_fd);
 		free_blacklist();
@@ -609,6 +713,9 @@ int main() {
 		// inotify kernel subsystem requires the buffer & requested byte size to be atleast sizeof(struct inotify_event)
 		int length = read(ininst_fd, ebuf, EVENT_BATCH_COUNT * event_size);
 		if (length < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+
 			syslog(LOG_ERR, "Error while reading inotify events: %m");
 			return_status = -1;
 			break;
@@ -631,13 +738,14 @@ int main() {
 			// Ignore the entry if it matches a blacklisted pattern
 			// Leading periods MUST be explicitly put in the blacklisted pattern
 			int skip_event = 0;
-			if (event->len > 0)
+			if (event->len > 0) {
 				for (int j = 0; j < blacklist_counter; j++)
 					if (fnmatch(blacklist[j], event->name, FNM_PERIOD) == 0) {
 						i += sizeof(struct inotify_event) + event->len;
 						skip_event = 1;
 						break;
 					}
+			}
 				
 			// File or Dir name matches blacklisted pattern	
 			if (skip_event)
@@ -653,30 +761,35 @@ int main() {
 			}
 
 			// File is closed after a write (Also triggered right after creation)
-			else if (event->mask & IN_CLOSE_WRITE)
-				backup_new_file(watched_dir, event);
+			else if (event->mask & IN_CLOSE_WRITE) {
+				char file_path[PATH_MAX], backup_file_path[PATH_MAX];
+				snprintf(file_path, 	   PATH_MAX, "%s/%s", watched_dir->path, event->name);
+				snprintf(backup_file_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(file_path));				
+				if (safe_copy(backup_file_path, file_path) != 0)
+					syslog(LOG_WARNING, "Unable to backup file: %s", file_path);
+			}
 
 			// ONLY delete if file --> skip on directory
 			else if (event->mask & IN_DELETE && !(event->mask & IN_ISDIR)) {
-				char backup_path[PATH_MAX];
-                               	snprintf(backup_path, PATH_MAX, "%s/%s/%s", backup_root, watched_dir->path, event->name);
-					
-				if (unlink(backup_path) != 0)
+				char file_path[PATH_MAX], backup_file_path[PATH_MAX];
+				snprintf(file_path, 	   PATH_MAX, "%s/%s", watched_dir->path, event->name);
+                                snprintf(backup_file_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(file_path)); 				
+				if (unlink(backup_file_path) != 0)
 					syslog(LOG_WARNING, "Error unlinking file: %m");
 			}
 
 			// Directory is deleted
 			// Linux behavior guarantees all subcontents are deleted (Files via IN_DELETE subdirs via IN_DELETE_SELF)
 			else if (event->mask & IN_DELETE_SELF) {
-				char backup_path[PATH_MAX];
-				snprintf(backup_path, PATH_MAX, "%s/%s", backup_root, watched_dir->path);
+				char backup_dir_path[PATH_MAX];
+				snprintf(backup_dir_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(watched_dir->path));
 
 				// Remove from hashmap
 				// Do not call inotify_rm_watch() as kernel has done so for us (specified by 0 below)
 				hm_delete_wddir(watched_dir, ininst_fd, 0);
 				
-				if (rmdir(backup_path) != 0)
-					syslog(LOG_WARNING, "Error removing fir: %m");
+				if (rmdir(backup_dir_path) != 0)
+					syslog(LOG_WARNING, "Error removing dir: %m");
 			}
 
 			// 'Move from' event
@@ -696,40 +809,56 @@ int main() {
 				struct cookie_event* mvf_event;
 				if ((mvf_event = hm_find_cookie_event(event->cookie))) {
 					struct wddir* mvf_dir = hm_find_wddir(mvf_event->wd);
+					if (!mvf_dir) {
+						syslog(LOG_WARNING, "Stale source wd for IN_MOVE_TO rename; dropping event");
+						hm_delete_cookie_event(mvf_event);
+						i += sizeof(struct inotify_event) + event->len;
+						continue;
+					}
 
 					// 1.) Rename the backup file/folder
+					char old_watch_path[PATH_MAX], 	new_watch_path[PATH_MAX];
 					char old_backup_path[PATH_MAX], new_backup_path[PATH_MAX];
-					snprintf(old_backup_path, PATH_MAX, "%s/%s/%s", backup_root, mvf_dir->path, mvf_event->name);
-					snprintf(new_backup_path, PATH_MAX, "%s/%s/%s", backup_root, watched_dir->path, event->name);
-					rename(old_backup_path, new_backup_path);		
+					snprintf(old_watch_path,  PATH_MAX, "%s/%s", mvf_dir->path, mvf_event->name);	
+					snprintf(new_watch_path,  PATH_MAX, "%s/%s", watched_dir->path, event->name);
+					snprintf(old_backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(old_watch_path));
+					snprintf(new_backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(new_watch_path));
+					
+					if (rename(old_backup_path, new_backup_path) != 0)
+						syslog(LOG_WARNING, "Failure renaming (%s) in backup path; de-sync immenent: %m", old_backup_path);	
 					
 					// 2.) Remove the entry from the IN_MOVED_FROM cache (hashmap)
 					hm_delete_cookie_event(mvf_event);
 
 					// 3.) Handle hashmap stale paths for renamed directories
 					if (event->mask & IN_ISDIR) {
-						char old_watched_path[PATH_MAX], new_watched_path[PATH_MAX];
 						
-						// Construct absolute paths for the watched directories
-            					snprintf(old_watched_path, PATH_MAX, "%s/%s", watched_dir->path, mvf_event->name);
-            					snprintf(new_watched_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
-	
 						// Nuke the old hashmap state and rebuild w/ updated paths 
 						// Unadds and readds inotify watch descriptors
-						hm_delete_tree_wddir(old_watched_path, ininst_fd, 1);
-						if (scan_watch_tree(new_watched_path, ininst_fd) == DSYNC_ERROR)
+						hm_delete_tree_wddir(old_watch_path, ininst_fd, 1);
+						if (watch_tree(new_watch_path, ininst_fd) == DSYNC_ERROR)
 							syslog(LOG_ERR, "Error scanning new 'IN_MOVED_TO' directory");
 					}
 				}
 			
 				// File/Dir was moved from an unwatched directory
-				// Treat as creation
+				// Treat as creation --> backup contents
 				else {
-					// Dir creation --> add to inotify watch
-					if (event->mask & IN_ISDIR) 
-						backup_and_watch_new_dir(ininst_fd, watched_dir, event);
+					char new_watch_path[PATH_MAX], new_backup_path[PATH_MAX];
+					snprintf(new_watch_path,  PATH_MAX, "%s/%s", watched_dir->path, event->name);
+					snprintf(new_backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(new_watch_path));
+
+					// Entry is a dir --> add entire tree to inotify watch 
+					if (event->mask & IN_ISDIR) {
+						if (watch_tree(new_watch_path, ininst_fd) != 0)
+							syslog(LOG_WARNING, "Warning: (%s) may not be fully synced with (%s)", new_backup_path, new_watch_path);
+						backup_tree(new_backup_path, new_watch_path);
+					}	
+
+					// Entry is a file
 					else
-						backup_new_file(watched_dir, event);	
+						if (safe_copy(new_backup_path, new_watch_path) != 0)
+							syslog(LOG_WARNING, "Unable to backup file: %s", new_watch_path);
 				}	
 			}
 
@@ -751,28 +880,19 @@ int main() {
 	
 			// Kernel overflowed with events
 			else if (event->mask & IN_Q_OVERFLOW) {
-				// Step 1: Force the fd into non-blocking mode to safely drain it
-				// This is because an inotify fd blocks indefinitely until it can return atleast 1 event (never EOF)
-        			int def_flags = fcntl(ininst_fd, F_GETFL, 0);
-        			fcntl(ininst_fd, F_SETFL, def_flags | O_NONBLOCK);
 				
-				// Step 2: Drain event queue (read until empty / EAGAIN / EWOULDNOTBLOCK err)
+				// Step 1: Drain event queue (read until empty / EAGAIN / EWOULDNOTBLOCK)
 				while (read(ininst_fd, ebuf, EVENT_BATCH_COUNT * event_size) > 0) {
 					// Deliberately drain all events
 				}
 
-				// Step 3: Restore original blocking flags
-				fcntl(ininst_fd, F_SETFL, def_flags);
-				
-				// Step 4: Clear current inotify tracking tree
-				// Clears hashmap and inotify wds
+				// Step 2: Clear current inotify tracking tree
+				// Also clear wddir and cookie_event hashmaps
 				hm_delete_all_wddir(ininst_fd, 1);
-				
-				// Step 4.5: Also clear the IN_MOVED_FROM hashmap (event cache)
 				hm_delete_all_cookie_event();
 				
-				// Step 5: Rebuild inotify tracking tree
-				if (scan_watch_tree(watch_root, ininst_fd) == DSYNC_ERROR)
+				// Step 3: Rebuild inotify tracking tree
+				if (watch_tree(watch_root, ininst_fd) == DSYNC_ERROR)
 					syslog(LOG_ERR, "Error rescanning root watch directory after IN_Q_OVERFLOW event");
 
 				// Exit the event queue read loop --> Go back to polling ininst_fd
