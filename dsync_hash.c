@@ -101,8 +101,6 @@ void hm_delete_all_wddir(int ininst_fd, int rmwatch) {
         struct wddir *current_wddir, *tmp;
         HASH_ITER(hh, wddir_hm, current_wddir, tmp) {
                 hm_delete_wddir(current_wddir, ininst_fd, rmwatch);         /* delete; entry advances to next */
-                //HASH_DEL(wddir_hm, current_entry);
-                //free(current_entry);        
         }
 }
 

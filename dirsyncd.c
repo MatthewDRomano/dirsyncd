@@ -3,12 +3,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>		// open() flags
-#include <fcntl.h>		// fcntl()
 #include <sys/inotify.h>	
 #include <limits.h>		// NAME_MAX / PATH_MAX
 #include <sys/stat.h>		// lstat()
 #include <signal.h>
 #include <errno.h>
+#include <fcntl.h>		// creat() / open()
 #include <string.h>
 #include <stdint.h>
 #include <dirent.h>		// opendir() / readdir()
@@ -44,7 +44,10 @@ static const char* wroot_keyword = "WATCH_PATH=";
 static const char* broot_keyword = "BACKUP_PATH=";
 
 
-// Free heap allocated blacklisted patterns
+// ========================================================
+// Frees every heap-allocated blacklist pattern string
+// ========================================================
+
 void free_blacklist() {
         for (int i = 0; i < blacklist_counter; i++)
                 free(blacklist[i]);
@@ -202,46 +205,10 @@ int parse_config() {
 }
 
 
-// Returns a pointer to the relative path fragment inside abs_path by stripping 
-// the leading watch_root or backup_root prefix. Returns "" if abs_path is the root itself, 
-// or NULL if it falls under neither. 
-// Do NOT free() the returned pointer; it aliases abs_path and shares its lifetime.
-const char* constr_rel_path(const char* abs_path) {
-	int wroot_path_len = strlen(watch_root);
-	int broot_path_len = strlen(backup_root);
-
-	// The absolute path is a watched directory
-	if (strncmp(abs_path, watch_root, wroot_path_len) == 0) {
-		const char* rel_path = abs_path + wroot_path_len;
-		if (*rel_path  == '/')
-			return rel_path + 1;
-
-		else if (*rel_path == '\0')
-			return rel_path;
-
-		// else: false-positive prefix match (e.g. "/data_backup" vs "/data") -- fall through
-	}
-
-	// The absolute path is a backup directory
-	if (strncmp(abs_path, backup_root, broot_path_len) == 0) {
-		const char* rel_path = abs_path + broot_path_len;
-		if (*rel_path == '/')
-			return rel_path + 1;
-		
-		else if (*rel_path == '\0')
-			return rel_path;
-
-		// else: same false positive fall through behavior as above
-	}
-
-	return NULL;
-}
-
-
 // ========================================================
-// Recursively add all sub dirs of path to inotify watch
+// Recursively adds all subdirectories of base_path to the inotify watch tree
 // ========================================================
-	
+
 int watch_tree(const char* base_path, int ininst_fd) {
 	DIR* dir = opendir(base_path);
 	
@@ -325,7 +292,7 @@ int watch_tree(const char* base_path, int ininst_fd) {
 
 // ========================================================
 // Safely copies file contents from one file to another
-// 	|-> Creates file if dest_path doesn't exist
+//	|-> Creates dest_path if it doesn't exist, preserving src_path's permissions
 // ========================================================
 
 int safe_copy(const char* dest_path, const char* src_path) {
@@ -398,8 +365,51 @@ int safe_copy(const char* dest_path, const char* src_path) {
 }
 
 
-// Takes a newly IN_MOVED_IN directory, and the corresponding event struct
-// The passed event mask should contain IN_CREATE & IN_ISDIR
+// ========================================================
+// Strips the leading watch_root or backup_root prefix from abs_path
+//	|-> Returns "" if abs_path is the root itself
+//	|-> Returns NULL if abs_path falls under neither root
+//	|-> Do NOT free() the result; it aliases abs_path and shares its lifetime
+// ========================================================
+
+const char* constr_rel_path(const char* abs_path) {
+	int wroot_path_len = strlen(watch_root);
+	int broot_path_len = strlen(backup_root);
+
+	// The absolute path is a watched directory
+	if (strncmp(abs_path, watch_root, wroot_path_len) == 0) {
+		const char* rel_path = abs_path + wroot_path_len;
+		if (*rel_path  == '/')
+			return rel_path + 1;
+
+		else if (*rel_path == '\0')
+			return rel_path;
+
+		// else: false-positive prefix match (e.g. "/data_backup" vs "/data") -- fall through
+	}
+
+	// The absolute path is a backup directory
+	if (strncmp(abs_path, backup_root, broot_path_len) == 0) {
+		const char* rel_path = abs_path + broot_path_len;
+		if (*rel_path == '/')
+			return rel_path + 1;
+
+		else if (*rel_path == '\0')
+			return rel_path;
+
+		// else: same false positive fall through behavior as above
+	}
+
+	return NULL;
+}
+
+
+// ========================================================
+// Handles a newly created directory (IN_CREATE | IN_ISDIR)
+//	|-> Adds the new directory to the inotify watch tree
+//	|-> Recreates it (with matching permissions) under BACKUP_PATH
+// ========================================================
+
 int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct inotify_event* event) {
 	if (!(event->mask & IN_CREATE) || !(event->mask & IN_ISDIR))
 		return -1;
@@ -454,7 +464,12 @@ int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct in
 }
 
 
-// Recursively backs up the files/directories in watch_path's subtree to backup_path
+// ========================================================
+// Recursively backs up watch_path's subtree into backup_path
+//	|-> Skips subtrees whose basename matches a blacklist pattern
+//	|-> Creates each directory (matching permissions) before backing up its children
+// ========================================================
+
 int backup_tree(const char* backup_path, const char* watch_path) {
 	
 	// Ensure watch_path is a valid directory
@@ -529,7 +544,10 @@ int backup_tree(const char* backup_path, const char* watch_path) {
 }
 
 
-// Recursively removes a backup path
+// ========================================================
+// Recursively removes a backup directory and everything under it
+// ========================================================
+
 int remove_backup_tree(const char* base_path) {
 	DIR* dir = opendir(base_path);
 	if (!dir) {
@@ -581,7 +599,12 @@ int remove_backup_tree(const char* base_path) {
 }
 
 
-// After specified poll() timeout, treat unmatched IN_MOVE_FROM events as deletions
+// ========================================================
+// Reconciles pending IN_MOVED_FROM events once the grace-period poll() timeout expires
+//	|-> A pending event with no matching IN_MOVED_TO means the source was moved
+//	    outside the watched tree -- treat it as a real delete
+// ========================================================
+
 void handle_unmatched_movefrom_events(int ininst_fd) {
 	struct cookie_event *current_event, *tmp;
 	
@@ -625,12 +648,22 @@ void handle_unmatched_movefrom_events(int ininst_fd) {
 }
 
 
-// SIGTERM handler for graceful shutdown
+// ========================================================
+// SIGTERM handler -- requests a graceful shutdown
+// ========================================================
+
 void sys_shutdown_handler(int sig) {
 	(void)sig;
 	shutdown_requested = 1;
 }
 
+
+// ========================================================
+// Daemon entry point
+//	|-> Parses config and builds the initial inotify watch tree
+//	|-> Drains and dispatches inotify events until SIGTERM
+//	|-> Tears down watches/hashmaps and exits cleanly
+// ========================================================
 
 int main() {
 	// Sets return value for success/failure
@@ -784,8 +817,7 @@ int main() {
 				char backup_dir_path[PATH_MAX];
 				snprintf(backup_dir_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(watched_dir->path));
 
-				// Remove from hashmap
-				// Do not call inotify_rm_watch() as kernel has done so for us (specified by 0 below)
+				// Remove from hashmap; rmwatch=0, kernel already dropped this watch itself
 				hm_delete_wddir(watched_dir, ininst_fd, 0);
 				
 				if (rmdir(backup_dir_path) != 0)
@@ -801,16 +833,18 @@ int main() {
 			}
 
 			// 'Move to' event
-			// File/folder is either moved into watched directory or renamed (always triggered AFTER a move from event)
+			// File/folder is either moved into watched directory or renamed.
+			// Only paired with a IN_MOVED_FROM event if the source was also watched --
+			// see the unmatched-cookie else branch below for the unwatched-source case.
 			else if (event->mask & IN_MOVED_TO) {
-				
-				// Hashmap entry corresponding to a IN_MOVED_FROM event is found 
+
+				// Hashmap entry corresponding to a IN_MOVED_FROM event is found
 				// Rename occured (allows cross directory moves)
 				struct cookie_event* mvf_event;
 				if ((mvf_event = hm_find_cookie_event(event->cookie))) {
 					struct wddir* mvf_dir = hm_find_wddir(mvf_event->wd);
 					if (!mvf_dir) {
-						syslog(LOG_WARNING, "Stale source wd for IN_MOVE_TO rename; dropping event");
+						syslog(LOG_WARNING, "Stale source wd for IN_MOVED_TO rename; dropping event");
 						hm_delete_cookie_event(mvf_event);
 						i += sizeof(struct inotify_event) + event->len;
 						continue;
@@ -862,26 +896,26 @@ int main() {
 				}	
 			}
 
-			/* Handles root watch-directory renames / moves
-			 * CRITICAL EVENT: nuke the wddir hashmap and inotify watch instances
-			  	* Exit process and force the user to update the config file with new watch path 
-			  	* Restart daemon to resume proper behavior
-			*/
+			// Handles root watch-directory renames/moves.
+			// CRITICAL EVENT: the root path in the config no longer refers to a valid
+			// watched location. Request shutdown and let the normal exit-path cleanup
+			// (bottom of main()) tear down the hashmaps/watches; the user must update
+			// the config file with the new path and restart the daemon.
 			else if (event->mask & IN_MOVE_SELF) {
-				// Confirms the root was moved/renamed --> Nuke hashmap
+				// Confirms the root itself (not some other watched dir) was moved/renamed
 				if (strcmp(watched_dir->path, watch_root) == 0) {
 					syslog(LOG_CRIT, "Root watch path altered: UPDATE CONF. & RESTART");
-	
+
 					// Breaks out of event read loop --> then fails outer while loop eval
 					shutdown_requested = 1;
-					break;	
+					break;
 				}
 			}
 	
 			// Kernel overflowed with events
 			else if (event->mask & IN_Q_OVERFLOW) {
 				
-				// Step 1: Drain event queue (read until empty / EAGAIN / EWOULDNOTBLOCK)
+				// Step 1: Drain event queue (read until empty / EAGAIN / EWOULDBLOCK)
 				while (read(ininst_fd, ebuf, EVENT_BATCH_COUNT * event_size) > 0) {
 					// Deliberately drain all events
 				}
@@ -904,7 +938,7 @@ int main() {
 			else if (event->mask & IN_UNMOUNT) {
 				syslog(LOG_NOTICE, "Dir unmounted: %s", watched_dir->path);
 				
-				// Do not call inotify_rm_watch(): '0'  --> wd was already removed by kernel
+				// rmwatch=0, wd was already removed by the kernel
 				hm_delete_wddir(watched_dir, ininst_fd, 0);
 			}
 

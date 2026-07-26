@@ -15,8 +15,8 @@ struct wddir {
 struct cookie_event {
         uint32_t cookie;        // key
         int wd;                 // value #1
-	uint32_t mask;
-	const char* name;
+        uint32_t mask;          // value #2
+        const char* name;       // value #3
         UT_hash_handle hh;      // Makes structure hashable via uthash
 };
 
@@ -32,7 +32,7 @@ extern struct cookie_event* cookie_event_hm;
 // uthash.h hashmap ADD methods
 // ========================================================
 
-// Key: watch desriptor 
+// Key: watch descriptor
 // Value(s): file path
 int hm_add_wddir(int wd, const char* path);
 
@@ -58,22 +58,24 @@ struct cookie_event* hm_find_cookie_event(uint32_t cookie_key);
 // uthash.h hashmap DELETE methods
 // ========================================================
 
-// Deletes wddir hashmap entry
-// Frees watch descriptor from inotify instance via ininst_fd
+// Deletes wddir hashmap entry.
+// rmwatch: nonzero calls inotify_rm_watch(ininst_fd, entry->wd) before freeing the entry.
+// Pass 0 when the kernel has already dropped the watch itself (e.g. reacting to
+// IN_DELETE_SELF/IN_UNMOUNT/IN_IGNORED), since re-removing a dead wd is an error.
 void hm_delete_wddir(struct wddir* entry, int ininst_fd, int rmwatch);
 
 // Deletes cookie_event hashmap entry
 void hm_delete_cookie_event(struct cookie_event* entry);
-       
-// Deletes ALL wddir hashmap entries 
-// Frees ALL watch descriptors from inotify instance via ininst_fd
+
+// Deletes ALL wddir hashmap entries. See hm_delete_wddir for rmwatch semantics.
 void hm_delete_all_wddir(int ininst_fd, int rmwatch);
-       
-// Deletes ALL cookie_event hashmap entries 
+
+// Deletes ALL cookie_event hashmap entries
 void hm_delete_all_cookie_event();
 
-// Removes a directory and all of its subdirectories from the hashmap and inotify instance(s)
-// Takes in null terminated path
+// Removes every wddir hashmap entry whose path is root_path itself or a subdirectory
+// of it (path-boundary safe: won't false-positive match "/data" against "/data_backup").
+// See hm_delete_wddir for rmwatch semantics.
 void hm_delete_tree_wddir(const char* root_path, int ininst_fd, int rmwatch);
 
 #endif
