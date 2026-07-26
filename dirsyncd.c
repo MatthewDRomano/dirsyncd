@@ -405,66 +405,6 @@ const char* constr_rel_path(const char* abs_path) {
 
 
 // ========================================================
-// Handles a newly created directory (IN_CREATE | IN_ISDIR)
-//	|-> Adds the new directory to the inotify watch tree
-//	|-> Recreates it (with matching permissions) under BACKUP_PATH
-// ========================================================
-
-int backup_and_watch_new_dir(int ininst_fd, struct wddir* watched_dir, struct inotify_event* event) {
-	if (!(event->mask & IN_CREATE) || !(event->mask & IN_ISDIR))
-		return -1;
-
-	// Use lstat() to read permissions of newly created dir
-        char new_dir_path[PATH_MAX];
-        snprintf(new_dir_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
-
-        struct stat dir_stat;
-        if (lstat(new_dir_path, &dir_stat) == 0) {
-		
-		// Watch new dir
-                int wd = inotify_add_watch(ininst_fd, new_dir_path, event_mask);
-                if (wd < 0) {
-                        if (errno == ENOSPC)
-                                syslog(LOG_ERR, "Out of inotify watch descriptors (fs.inotify.max_user_watches) -- aborting scan: %m");
-                        else
-                                syslog(LOG_WARNING, "Unable to watch new directory: %m");
-
-                        return (errno == ENOSPC) ? DSYNC_ERROR : DSYNC_WARNING;
-                }
-
-		// Add to hashmap
-                if (hm_add_wddir(wd, new_dir_path) != 0) { 
-			inotify_rm_watch(ininst_fd, wd);
-			return DSYNC_ERROR;
-		}
-        	
-		// use mkdir to copy dir w/ same permissions
-                char backup_path[PATH_MAX];
-                snprintf(backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(new_dir_path));
-
-                // Explicitly apply permissions via chmod to override the system umask
-                mode_t target_mode = dir_stat.st_mode & 0777;
-                if (mkdir(backup_path, target_mode) == 0) {
-                	chmod(backup_path, target_mode);
-                }
-		else {
-			syslog(LOG_WARNING, "Unable to make directory: %m");
-			hm_delete_wddir(hm_find_wddir(wd), ininst_fd, 1);
-			return DSYNC_WARNING;
-		}
-		
-	}
-
-	else {
-		syslog(LOG_WARNING, "lstat() error reading new dir perms: %m");
-		return DSYNC_WARNING;
-	}
-
-	return 0;
-}
-
-
-// ========================================================
 // Recursively backs up watch_path's subtree into backup_path
 //	|-> Skips subtrees whose basename matches a blacklist pattern
 //	|-> Creates each directory (matching permissions) before backing up its children
@@ -524,12 +464,14 @@ int backup_tree(const char* backup_path, const char* watch_path) {
 			}
 	
 			// Child is file
-			else {
+			else if (S_ISREG(child_sb.st_mode)){
 				if (safe_copy(child_backup_path, child_watch_path) != 0) {
-					syslog(LOG_WARNING, "Fail to copy child within moved-in tree");
+					syslog(LOG_WARNING, "Fail to copy child file within moved-in tree");
 					scan_rc = DSYNC_WARNING;
 				}
 			}
+	
+			// Ignore if symlink or other type
 		}
 
 		else {
@@ -790,7 +732,14 @@ int main() {
 	
 			// Folder is created (Ignore file creation)
 			if (event->mask & IN_CREATE && event->mask & IN_ISDIR) {
-				backup_and_watch_new_dir(ininst_fd, watched_dir, event);
+				char dir_path[PATH_MAX], backup_dir_path[PATH_MAX];
+				snprintf(dir_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
+				snprintf(backup_dir_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(dir_path));
+
+				if (watch_tree(dir_path, ininst_fd) == DSYNC_ERROR)
+					syslog(LOG_ERR, "Warning (%s) may not be fully synced with (%s)", backup_dir_path, dir_path);
+
+				backup_tree(backup_dir_path, dir_path);
 			}
 
 			// File is closed after a write (Also triggered right after creation)
