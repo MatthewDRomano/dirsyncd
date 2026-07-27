@@ -296,30 +296,54 @@ int watch_tree(const char* base_path, int ininst_fd) {
 // ========================================================
 
 int safe_copy(const char* dest_path, const char* src_path) {
-	int src_fd = open(src_path, O_RDONLY);
-	if (src_fd < 0) {
-		syslog(LOG_WARNING, "Error opening src file for copying (%s): %m", src_path);
-		return DSYNC_WARNING;
-	}
-
-	// Copy src file perms for dest file
-	struct stat sb;
-	if (lstat(src_path, &sb) != 0) {
+	
+	// Ensure src_path is a valid file (not dir, symlink, or other)
+	struct stat src_sb, dest_sb;
+	if (lstat(src_path, &src_sb) != 0) {
 		syslog(LOG_WARNING, "Error w/ lstat() during copy: %m");
-        	close(src_fd);
-	        return DSYNC_WARNING;
-	}
+		return DSYNC_WARNING;
+	} 
 
-	// Equivalent to open() with flags: O_CREAT | O_TRUNC | O_WRONLY
-	int dest_fd = creat(dest_path, 0600);
-	if (dest_fd < 0) {
-		syslog(LOG_WARNING, "Error opening dest file for copying(%s): %m", dest_path);
-		close(src_fd);
+	else if (!S_ISREG(src_sb.st_mode)) {
+		syslog(LOG_WARNING, "Source path: %s is not a file", src_path);
 		return DSYNC_WARNING;
 	}
+
+	// Get source file descriptor   
+        int src_fd = open(src_path, O_RDONLY);
+        if (src_fd < 0) {
+                syslog(LOG_WARNING, "Error opening src file for copying (%s): %m", src_path);
+                return DSYNC_WARNING;
+        }
+
+        // Get destination file descriptor
+        // Equivalent to open() with flags: O_CREAT | O_TRUNC | O_WRONLY
+        int dest_fd = creat(dest_path, 0600);
+        if (dest_fd < 0) {
+                syslog(LOG_WARNING, "Error opening dest file for copying(%s): %m", dest_path);
+                close(src_fd);
+                return DSYNC_WARNING;
+        }
+
+
+	// Ensure dest_path is a valid file (not dir, symlink, or other)
+	if (lstat(dest_path, &dest_sb) != 0) {
+		syslog(LOG_WARNING, "Error w/ lstat() during copy: %m");
+		close(src_fd);
+		close(dest_fd);
+		return DSYNC_WARNING;
+	}
+
+	else if (!S_ISREG(dest_sb.st_mode)) {
+		syslog(LOG_WARNING, "Destination path: %s is not a file", dest_path);
+		close(src_fd);
+                close(dest_fd);
+		return DSYNC_WARNING;
+	}
+
 	
 	// Ensure the source files permissions cary over --> overrides umask
-	fchmod(dest_fd, 0777 & sb.st_mode);
+	fchmod(dest_fd, 0777 & src_sb.st_mode);
 
 	// Stops reading on EOF or error
 	char cpy_buf[8192]; // 8KB page buffer
@@ -470,8 +494,10 @@ int backup_tree(const char* backup_path, const char* watch_path) {
 					scan_rc = DSYNC_WARNING;
 				}
 			}
-	
-			// Ignore if symlink or other type
+
+			// System log a notice that symlinks are skipped in backups
+			else if (S_ISLNK(child_sb.st_mode))
+				syslog(LOG_NOTICE, "Skipping symlink: %s", child_watch_path);
 		}
 
 		else {
@@ -515,7 +541,7 @@ int remove_backup_tree(const char* base_path) {
 					rc = DSYNC_WARNING;	
 			}		
 
-			// Otherwise file --> remove
+			// Otherwise file/symlink --> safe to remove
 			else {
 				if (unlink(child_path) != 0) {
                 	                syslog(LOG_WARNING, "unlink() error while cleaning backup path: %m");
