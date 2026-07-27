@@ -99,10 +99,6 @@ freely (see the shipped `dirsyncd.conf` for a documented example).
   `Path_MAX` is abundantly forgiving.
 - **No symlink following.** Symlinks are stat'd with `lstat`, so the daemon
   won't traverse into or copy through them.
-- **Zero-write files** (e.g. a bare `touch`) won't trigger a backup — dirsyncd
-  reacts to `IN_CLOSE_WRITE`, which only fires after a file is opened for
-  writing and closed. A file that's created but never written stays untracked
-  content-wise until it is.
 - **Under sustained event-queue overflow**, a move/rename can theoretically
   land as a delete on the backup side if the `MOVED_TO` half of the pair is
   among the events the kernel drops. The full-rescan recovery keeps the tree
