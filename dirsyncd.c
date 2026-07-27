@@ -489,6 +489,20 @@ int backup_tree(const char* backup_path, const char* watch_path) {
 	
 			// Child is file
 			else if (S_ISREG(child_sb.st_mode)){
+
+				// First check if file matches a blacklisted pattern
+				char* child_name = strrchr(child_watch_path, '/');
+				child_name = (child_name) ? child_name + 1 : child_watch_path;
+
+				int skip_entry = 0;
+				for (int i = 0; i < blacklist_counter; i++)
+					if (fnmatch(blacklist[i], child_name, FNM_PERIOD) == 0)
+						skip_entry = 1;	
+
+				if (skip_entry)
+					continue;
+
+				// Backup file contents
 				if (safe_copy(child_backup_path, child_watch_path) != 0) {
 					syslog(LOG_WARNING, "Fail to copy child file within moved-in tree");
 					scan_rc = DSYNC_WARNING;
@@ -756,16 +770,26 @@ int main() {
         		// Process events on valid entries
         		// ========================================================
 	
-			// Folder is created (Ignore file creation)
-			if (event->mask & IN_CREATE && event->mask & IN_ISDIR) {
-				char dir_path[PATH_MAX], backup_dir_path[PATH_MAX];
-				snprintf(dir_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
-				snprintf(backup_dir_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(dir_path));
+			// File / Folder creation
+			if (event->mask & IN_CREATE) {
+				char watch_path[PATH_MAX], backup_path[PATH_MAX];
+				snprintf(watch_path, PATH_MAX, "%s/%s", watched_dir->path, event->name);
+				snprintf(backup_path, PATH_MAX, "%s/%s", backup_root, constr_rel_path(watch_path));
 
-				if (watch_tree(dir_path, ininst_fd) == DSYNC_ERROR)
-					syslog(LOG_ERR, "Warning (%s) may not be fully synced with (%s)", backup_dir_path, dir_path);
+				// Handles folder creation (Checks tree recursively to catch missed events)
+				if (event->mask & IN_ISDIR) {
+					if (watch_tree(watch_path, ininst_fd) == DSYNC_ERROR)
+						syslog(LOG_WARNING, "Warning (%s) may not be fully synced with (%s)", backup_path, watch_path);
 
-				backup_tree(backup_dir_path, dir_path);
+					backup_tree(backup_path, watch_path);
+				}
+
+				// Handles file creation
+				else {		
+					// safe_copy() ensures watch_path is a regular file, not a symlink or other
+					if (safe_copy(backup_path, watch_path) != 0)
+						syslog(LOG_WARNING, "Unable to backup new file creation: %s", watch_path);
+				}
 			}
 
 			// File is closed after a write (Also triggered right after creation)
