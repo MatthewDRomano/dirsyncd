@@ -43,6 +43,14 @@ a clean shutdown — watches are released and hash tables freed before exit.
 
 ## Building
 
+Requirements:
+
+- C99-compliant compiler
+- POSIX.1-2008 libc — for `getline()` (POSIX-only, never adopted into the C
+  standard) and `strdup()` (POSIX.1-2008, standardized in C23); pulled in
+  via `_POSIX_C_SOURCE 200809L` in-source, so no `-std=` flag is required
+- Linux kernel with `inotify` support (≥ 2.6.13)
+
 ```sh
 gcc -Wall -Wextra -O2 -o dirsyncd dirsyncd.c dsync_hash.c
 ```

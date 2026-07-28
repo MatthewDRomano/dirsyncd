@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L // getline (posix func from POSIX.1-2008 standard)
+#define _POSIX_C_SOURCE 200809L // getline() / strdup() - POSIX.1-2008 standard
 
 #include <stdlib.h>
 #include <stdio.h>

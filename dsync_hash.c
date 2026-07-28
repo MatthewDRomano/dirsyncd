@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L // strdup() - POSIX.1-2008 standard
+
 #include "dsync_hash.h"
 #include <sys/inotify.h>
 #include <stdlib.h>
