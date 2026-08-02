@@ -55,10 +55,10 @@ Requirements:
 gcc -Wall -Wextra -O2 -o dirsyncd dirsyncd.c dsync_hash.c
 ```
 
-That's it. Copy the resulting binary wherever you'd normally stash a system daemon
+Copy the created binary wherever you'd normally stash a system daemon
 (`/usr/local/sbin`, etc.) and run it as a service (systemd unit, sysvinit script,
-whatever your distro prefers) — it doesn't background/fork itself, so let your
-service manager handle that part.
+whatever your distro prefers). It doesn't background/fork itself, so the
+service manager will handle that part.
 
 ## Configuration
 
