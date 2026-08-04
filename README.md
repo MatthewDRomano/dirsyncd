@@ -22,17 +22,19 @@ on every subdirectory, storing the watch descriptor → path mapping in a hash t
 (`dsync_hash.c`, built on uthash). From then on it just drains the `inotify` event
 queue and reacts:
 
-- **File written** (`IN_CLOSE_WRITE`) → copy it into the mirrored location under `BACKUP_PATH`, preserving permission bits.
+- **File written** (`IN_CLOSE_WRITE`) → copy changes into the mirrored location under `BACKUP_PATH`, preserving permission bits.
+- **File Created** → recreate file in the backup path.
 - **Directory created** → watch it, recreate it on the backup side.
-- **File/dir deleted** → remove the mirrored copy.
-- **Moved or renamed** → this is the fun one. `inotify` reports a move as two separate
+- **File/dir deleted** → remove the mirrored copy for a file; recursively remove the mirrored directory tree. 
+- **Moved or renamed** → this is the fun one. `inotify` reports a rename as two separate
   events, `IN_MOVED_FROM` and `IN_MOVED_TO`, correlated by a shared `cookie` value —
   and nothing guarantees the second one ever arrives (the file might have been moved
   outside the watched tree entirely). dirsyncd stashes the `MOVED_FROM` event in a
   cookie-keyed table and gives it a short grace window (one `poll()` timeout cycle)
   to be claimed by a matching `MOVED_TO`. If it's claimed, the backup gets renamed
   in place, even across two different watched directories. If it times out
-  unclaimed, it's treated as a real delete.
+  unclaimed, it's treated as a real delete. A solo 'IN_MOVED_TO' (no corresponding 'IN_MOVED_FROM') 
+  is treated as file/dir creation. A created dir is recursively backed up.
 - **Queue overflow** (`IN_Q_OVERFLOW`) → the kernel dropped events because the daemon
   fell behind. dirsyncd drains what's left, tears down every watch, and does a full
   rescan of `WATCH_PATH` to get back to a known-good state rather than silently
